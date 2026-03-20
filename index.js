@@ -289,10 +289,10 @@ class TwentyCRMServer {
               type: "object",
               properties: {
                 title: { type: "string", description: "Note title" },
-                body: { type: "string", description: "Note content" },
+                body: { type: "string", description: "Note content (plain text or markdown)" },
                 position: { type: "number", description: "Position for ordering" }
               },
-              required: ["title", "body"]
+              required: ["title"]
             }
           },
           {
@@ -442,14 +442,79 @@ class TwentyCRMServer {
               type: "object",
               properties: {
                 query: { type: "string", description: "Search query" },
-                objectTypes: { 
-                  type: "array", 
+                objectTypes: {
+                  type: "array",
                   items: { type: "string" },
-                  description: "Object types to search (e.g., ['people', 'companies'])" 
+                  description: "Object types to search (e.g., ['people', 'companies'])"
                 },
                 limit: { type: "number", description: "Number of results per object type" }
               },
               required: ["query"]
+            }
+          },
+
+          // Custom / Generic Object Operations
+          {
+            name: "create_record",
+            description: "Create a record of any object type, including custom objects (e.g. kontentPlan, products, deals)",
+            inputSchema: {
+              type: "object",
+              properties: {
+                objectType: { type: "string", description: "Plural API name of the object (e.g. 'kontentPlans', 'products')" },
+                data: { type: "object", description: "Field values for the new record" }
+              },
+              required: ["objectType", "data"]
+            }
+          },
+          {
+            name: "list_records",
+            description: "List records of any object type, including custom objects",
+            inputSchema: {
+              type: "object",
+              properties: {
+                objectType: { type: "string", description: "Plural API name of the object (e.g. 'kontentPlans', 'products')" },
+                limit: { type: "number", description: "Number of results (default: 20)" },
+                offset: { type: "number", description: "Number of results to skip (default: 0)" },
+                filter: { type: "string", description: "Filter string to append to the query" }
+              },
+              required: ["objectType"]
+            }
+          },
+          {
+            name: "get_record",
+            description: "Get a single record of any object type by ID",
+            inputSchema: {
+              type: "object",
+              properties: {
+                objectType: { type: "string", description: "Plural API name of the object (e.g. 'kontentPlans', 'products')" },
+                id: { type: "string", description: "Record ID" }
+              },
+              required: ["objectType", "id"]
+            }
+          },
+          {
+            name: "update_record",
+            description: "Update a record of any object type by ID",
+            inputSchema: {
+              type: "object",
+              properties: {
+                objectType: { type: "string", description: "Plural API name of the object (e.g. 'kontentPlans', 'products')" },
+                id: { type: "string", description: "Record ID" },
+                data: { type: "object", description: "Fields to update" }
+              },
+              required: ["objectType", "id", "data"]
+            }
+          },
+          {
+            name: "delete_record",
+            description: "Delete a record of any object type by ID",
+            inputSchema: {
+              type: "object",
+              properties: {
+                objectType: { type: "string", description: "Plural API name of the object (e.g. 'kontentPlans', 'products')" },
+                id: { type: "string", description: "Record ID" }
+              },
+              required: ["objectType", "id"]
             }
           }
         ]
@@ -518,6 +583,18 @@ class TwentyCRMServer {
           // Search operations
           case "search_records":
             return await this.searchRecords(args);
+
+          // Generic / custom object operations
+          case "create_record":
+            return await this.createRecord(args);
+          case "list_records":
+            return await this.listRecords(args);
+          case "get_record":
+            return await this.getRecord(args);
+          case "update_record":
+            return await this.updateRecord(args);
+          case "delete_record":
+            return await this.deleteRecord(args);
 
           default:
             throw new Error(`Unknown tool: ${name}`);
@@ -678,7 +755,12 @@ class TwentyCRMServer {
 
   // Note methods
   async createNote(data) {
-    const result = await this.makeRequest("/rest/notes", "POST", data);
+    const { body, ...rest } = data;
+    const payload = { ...rest };
+    if (body) {
+      payload.bodyV2 = { markdown: body };
+    }
+    const result = await this.makeRequest("/rest/notes", "POST", payload);
     return {
       content: [
         {
@@ -721,8 +803,12 @@ class TwentyCRMServer {
   }
 
   async updateNote(data) {
-    const { id, ...updateData } = data;
-    const result = await this.makeRequest(`/rest/notes/${id}`, "PUT", updateData);
+    const { id, body, ...rest } = data;
+    const updateData = { ...rest };
+    if (body) {
+      updateData.bodyV2 = { markdown: body };
+    }
+    const result = await this.makeRequest(`/rest/notes/${id}`, "PATCH", updateData);
     return {
       content: [
         {
@@ -840,6 +926,34 @@ class TwentyCRMServer {
         }
       ]
     };
+  }
+
+  // Generic / custom object methods
+  async createRecord({ objectType, data }) {
+    const result = await this.makeRequest(`/rest/${objectType}`, "POST", data);
+    return { content: [{ type: "text", text: `Created ${objectType} record: ${JSON.stringify(result, null, 2)}` }] };
+  }
+
+  async listRecords({ objectType, limit = 20, offset = 0, filter }) {
+    let endpoint = `/rest/${objectType}?limit=${limit}&offset=${offset}`;
+    if (filter) endpoint += `&${filter}`;
+    const result = await this.makeRequest(endpoint);
+    return { content: [{ type: "text", text: `${objectType} records: ${JSON.stringify(result, null, 2)}` }] };
+  }
+
+  async getRecord({ objectType, id }) {
+    const result = await this.makeRequest(`/rest/${objectType}/${id}`);
+    return { content: [{ type: "text", text: `${objectType} record: ${JSON.stringify(result, null, 2)}` }] };
+  }
+
+  async updateRecord({ objectType, id, data }) {
+    const result = await this.makeRequest(`/rest/${objectType}/${id}`, "PATCH", data);
+    return { content: [{ type: "text", text: `Updated ${objectType} record: ${JSON.stringify(result, null, 2)}` }] };
+  }
+
+  async deleteRecord({ objectType, id }) {
+    await this.makeRequest(`/rest/${objectType}/${id}`, "DELETE");
+    return { content: [{ type: "text", text: `Deleted ${objectType} record with ID: ${id}` }] };
   }
 
   // Search methods
