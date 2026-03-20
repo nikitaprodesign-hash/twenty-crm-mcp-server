@@ -1,0 +1,31 @@
+version: "3.9"
+services:
+  mcp:
+    build: .
+    container_name: twenty-mcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TRANSPORT_MODE: sse
+      PORT: 3000
+    expose:
+      - "3000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.twenty-mcp.rule=Host(`${MCP_DOMAIN}`)"
+      - "traefik.http.routers.twenty-mcp.entrypoints=websecure"
+      - "traefik.http.routers.twenty-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.twenty-mcp.loadbalancer.server.port=3000"
+      - "traefik.http.middlewares.twenty-mcp-sse.headers.customresponseheaders.X-Accel-Buffering=no"
+      - "traefik.http.routers.twenty-mcp.middlewares=twenty-mcp-sse"
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  dokploy-network:
+    external: true

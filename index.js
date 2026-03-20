@@ -2,10 +2,13 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import express from "express";
+import { createServer } from "node:http";
 
 class TwentyCRMServer {
   constructor() {
@@ -28,7 +31,7 @@ class TwentyCRMServer {
       throw new Error("TWENTY_API_KEY environment variable is required");
     }
 
-    this.setupToolHandlers();
+    this._attachHandlers(this.server);
   }
 
   async makeRequest(endpoint, method = "GET", data = null) {
@@ -60,8 +63,8 @@ class TwentyCRMServer {
     }
   }
 
-  setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+  _attachHandlers(server) {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
         tools: [
           // People Management
@@ -385,7 +388,7 @@ class TwentyCRMServer {
       };
     });
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
       try {
@@ -796,9 +799,55 @@ class TwentyCRMServer {
   }
 
   async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error("Twenty CRM MCP server running on stdio");
+    const mode = process.env.TRANSPORT_MODE || "stdio";
+
+    if (mode === "stdio") {
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+      console.error("Twenty CRM MCP server running on stdio");
+      return;
+    }
+
+    // SSE HTTP mode
+    const app = express();
+    const port = parseInt(process.env.PORT || "3000", 10);
+    const mcpToken = process.env.MCP_AUTH_TOKEN;
+
+    const authenticate = (req, res, next) => {
+      if (!mcpToken) return next();
+      const auth = req.headers["authorization"] || "";
+      const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+      if (token !== mcpToken) return res.status(401).json({ error: "Unauthorized" });
+      next();
+    };
+
+    const transports = new Map(); // sessionId -> SSEServerTransport
+
+    app.get("/health", (req, res) => res.json({ status: "ok", server: "twenty-crm-mcp" }));
+
+    app.get("/sse", authenticate, async (req, res) => {
+      const transport = new SSEServerTransport("/message", res);
+      transports.set(transport.sessionId, transport);
+      transport.onclose = () => transports.delete(transport.sessionId);
+
+      const mcpServer = new Server(
+        { name: "twenty-crm", version: "0.1.0" },
+        { capabilities: { tools: {} } }
+      );
+      this._attachHandlers(mcpServer);
+      await mcpServer.connect(transport);
+      console.error(`[SSE] Client connected: ${transport.sessionId}`);
+    });
+
+    app.post("/message", authenticate, async (req, res) => {
+      const transport = transports.get(req.query.sessionId);
+      if (!transport) return res.status(404).json({ error: "Session not found" });
+      await transport.handlePostMessage(req, res);
+    });
+
+    createServer(app).listen(port, () =>
+      console.error(`Twenty CRM MCP (SSE) listening on port ${port}`)
+    );
   }
 }
 
