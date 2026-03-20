@@ -10,8 +10,9 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.6.0",
-    "express": "^4.22.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "express": "^4.22.1",
+    "jose": "^5.10.0"
   },
   "engines": {
     "node": ">=18"

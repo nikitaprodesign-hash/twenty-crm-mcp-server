@@ -2,13 +2,81 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { SignJWT, jwtVerify } from "jose";
 import express from "express";
 import { createServer } from "node:http";
+import { randomBytes, randomUUID } from "node:crypto";
+
+class SimpleOAuthProvider {
+  constructor(serverUrl, jwtSecret) {
+    this.serverUrl = serverUrl;
+    this._jwtSecret = new TextEncoder().encode(jwtSecret);
+    this._clients = new Map();   // clientId → OAuthClientInformationFull
+    this._authCodes = new Map(); // code → { clientId, redirectUri, codeChallenge, expiresAt }
+
+    this.clientsStore = {
+      getClient: (clientId) => this._clients.get(clientId),
+      registerClient: (client) => {
+        this._clients.set(client.client_id, client);
+        return client;
+      },
+    };
+  }
+
+  async authorize(client, params, res) {
+    const code = randomBytes(32).toString("hex");
+    this._authCodes.set(code, {
+      clientId: client.client_id,
+      redirectUri: params.redirectUri,
+      codeChallenge: params.codeChallenge,
+      codeChallengeMethod: params.codeChallengeMethod,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    const redirectUrl = new URL(params.redirectUri);
+    redirectUrl.searchParams.set("code", code);
+    if (params.state) redirectUrl.searchParams.set("state", params.state);
+    res.redirect(redirectUrl.toString());
+  }
+
+  async challengeForAuthorizationCode(_client, authorizationCode) {
+    return this._authCodes.get(authorizationCode)?.codeChallenge;
+  }
+
+  async exchangeAuthorizationCode(client, authorizationCode) {
+    const data = this._authCodes.get(authorizationCode);
+    this._authCodes.delete(authorizationCode);
+    if (!data || data.expiresAt < Date.now()) throw new Error("Invalid or expired code");
+
+    const accessToken = await new SignJWT({ sub: client.client_id, scope: "" })
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuedAt()
+      .setExpirationTime("1h")
+      .sign(this._jwtSecret);
+
+    return { access_token: accessToken, token_type: "bearer", expires_in: 3600 };
+  }
+
+  async exchangeRefreshToken() {
+    throw new Error("Refresh tokens not supported");
+  }
+
+  async verifyAccessToken(token) {
+    const { payload } = await jwtVerify(token, this._jwtSecret);
+    return {
+      token,
+      clientId: String(payload.sub),
+      scopes: payload.scope ? String(payload.scope).split(" ") : [],
+      expiresAt: payload.exp,
+    };
+  }
+}
 
 class TwentyCRMServer {
   constructor() {
@@ -808,45 +876,65 @@ class TwentyCRMServer {
       return;
     }
 
-    // SSE HTTP mode
+    // Streamable HTTP + OAuth mode
     const app = express();
     const port = parseInt(process.env.PORT || "3000", 10);
-    const mcpToken = process.env.MCP_AUTH_TOKEN;
+    const serverUrl = new URL(process.env.MCP_SERVER_URL || `http://localhost:${port}`);
+    const jwtSecret = process.env.MCP_AUTH_TOKEN || randomBytes(32).toString("hex");
 
-    const authenticate = (req, res, next) => {
-      if (!mcpToken) return next();
-      const auth = req.headers["authorization"] || "";
-      const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-      if (token !== mcpToken) return res.status(401).json({ error: "Unauthorized" });
-      next();
+    const oauthProvider = new SimpleOAuthProvider(serverUrl, jwtSecret);
+
+    // OAuth endpoints: /.well-known/oauth-protected-resource,
+    //                  /.well-known/oauth-authorization-server,
+    //                  GET /authorize, POST /register, POST /token
+    app.use(mcpAuthRouter({ provider: oauthProvider, issuerUrl: serverUrl }));
+
+    const authMiddleware = requireBearerAuth({ verifier: oauthProvider });
+
+    const transports = {}; // sessionId → StreamableHTTPServerTransport
+
+    app.get("/health", (_req, res) => res.json({ status: "ok", server: "twenty-crm-mcp" }));
+
+    const mcpHandler = async (req, res) => {
+      try {
+        const sessionId = req.headers["mcp-session-id"];
+
+        if (sessionId && transports[sessionId]) {
+          await transports[sessionId].handleRequest(req, res, req.body);
+          return;
+        }
+
+        if (!sessionId && req.method === "POST") {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid) => { transports[sid] = transport; },
+          });
+          transport.onclose = () => {
+            if (transport.sessionId) delete transports[transport.sessionId];
+          };
+          const mcpServer = new Server(
+            { name: "twenty-crm", version: "0.1.0" },
+            { capabilities: { tools: {} } }
+          );
+          this._attachHandlers(mcpServer);
+          await mcpServer.connect(transport);
+          await transport.handleRequest(req, res, req.body);
+          return;
+        }
+
+        res.status(400).json({ error: "Invalid request: missing or unknown session" });
+      } catch (err) {
+        console.error("[MCP] handler error:", err);
+        if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+      }
     };
 
-    const transports = new Map(); // sessionId -> SSEServerTransport
-
-    app.get("/health", (req, res) => res.json({ status: "ok", server: "twenty-crm-mcp" }));
-
-    app.get("/sse", authenticate, async (req, res) => {
-      const transport = new SSEServerTransport("/message", res);
-      transports.set(transport.sessionId, transport);
-      transport.onclose = () => transports.delete(transport.sessionId);
-
-      const mcpServer = new Server(
-        { name: "twenty-crm", version: "0.1.0" },
-        { capabilities: { tools: {} } }
-      );
-      this._attachHandlers(mcpServer);
-      await mcpServer.connect(transport);
-      console.error(`[SSE] Client connected: ${transport.sessionId}`);
-    });
-
-    app.post("/message", authenticate, async (req, res) => {
-      const transport = transports.get(req.query.sessionId);
-      if (!transport) return res.status(404).json({ error: "Session not found" });
-      await transport.handlePostMessage(req, res);
-    });
+    app.post("/mcp", authMiddleware, mcpHandler);
+    app.get("/mcp", authMiddleware, mcpHandler);
+    app.delete("/mcp", authMiddleware, mcpHandler);
 
     createServer(app).listen(port, () =>
-      console.error(`Twenty CRM MCP (SSE) listening on port ${port}`)
+      console.error(`Twenty CRM MCP (Streamable HTTP + OAuth) listening on port ${port}`)
     );
   }
 }
