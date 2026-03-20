@@ -882,6 +882,25 @@ class TwentyCRMServer {
     const serverUrl = new URL(process.env.MCP_SERVER_URL || `http://localhost:${port}`);
     const jwtSecret = process.env.MCP_AUTH_TOKEN || randomBytes(32).toString("hex");
 
+    // Parse JSON bodies — required for /register, /token and /mcp POST
+    app.use(express.json());
+
+    // CORS — Claude.ai is a browser app, needs cross-origin headers
+    app.use((req, res, next) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type, Mcp-Session-Id, Last-Event-Id, Mcp-Protocol-Version"
+      );
+      res.setHeader(
+        "Access-Control-Expose-Headers",
+        "WWW-Authenticate, Mcp-Session-Id"
+      );
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      if (req.method === "OPTIONS") return res.sendStatus(204);
+      next();
+    });
+
     const oauthProvider = new SimpleOAuthProvider(serverUrl, jwtSecret);
 
     // OAuth endpoints: /.well-known/oauth-protected-resource,
