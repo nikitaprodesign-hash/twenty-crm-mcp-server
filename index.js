@@ -131,6 +131,43 @@ class TwentyCRMServer {
     }
   }
 
+  _capitalize(value) {
+    if (!value) return value;
+    return value.charAt(0).toUpperCase() + value.slice(1);
+  }
+
+  _singularize(value) {
+    if (!value) return value;
+    const lower = value.toLowerCase();
+    if (lower === "people") return "person";
+    if (value.endsWith("ies") && value.length > 3) return `${value.slice(0, -3)}y`;
+    if (/(ches|shes|ses|xes|zes)$/.test(value)) return value.slice(0, -2);
+    if (value.endsWith("s") && !value.endsWith("ss")) return value.slice(0, -1);
+    return value;
+  }
+
+  _noteTargetFieldFor(objectType) {
+    const overrides = {
+      kontentPlan: "targetKontentId",
+      kontentPlans: "targetKontentId",
+    };
+    if (overrides[objectType]) return overrides[objectType];
+    const singular = this._singularize(objectType);
+    return `target${this._capitalize(singular)}Id`;
+  }
+
+  _extractBatchArray(response) {
+    if (Array.isArray(response)) return response;
+    if (!response || typeof response !== "object") return null;
+    if (Array.isArray(response.data)) return response.data;
+    if (Array.isArray(response.items)) return response.items;
+    if (response.data && typeof response.data === "object") {
+      const arrays = Object.values(response.data).filter(Array.isArray);
+      if (arrays.length === 1) return arrays[0];
+    }
+    return null;
+  }
+
   _attachHandlers(server) {
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
@@ -516,6 +553,37 @@ class TwentyCRMServer {
               },
               required: ["objectType", "id"]
             }
+          },
+          {
+            name: "batch_import",
+            description: "Batch create records with optional notes and auto-link them via noteTargets. Max 60 items per call.",
+            inputSchema: {
+              type: "object",
+              required: ["objectType", "items"],
+              properties: {
+                objectType: { type: "string", description: "Plural API name of the object (e.g. 'kontentPlan')" },
+                items: {
+                  type: "array",
+                  maxItems: 60,
+                  description: "Array of records to create with optional notes",
+                  items: {
+                    type: "object",
+                    required: ["data"],
+                    properties: {
+                      data: { type: "object", description: "Field values for the record" },
+                      note: {
+                        type: "object",
+                        required: ["title"],
+                        properties: {
+                          title: { type: "string" },
+                          body: { type: "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         ]
       };
@@ -595,6 +663,8 @@ class TwentyCRMServer {
             return await this.updateRecord(args);
           case "delete_record":
             return await this.deleteRecord(args);
+          case "batch_import":
+            return await this.batchImport(args);
 
           default:
             throw new Error(`Unknown tool: ${name}`);
@@ -954,6 +1024,179 @@ class TwentyCRMServer {
   async deleteRecord({ objectType, id }) {
     await this.makeRequest(`/rest/${objectType}/${id}`, "DELETE");
     return { content: [{ type: "text", text: `Deleted ${objectType} record with ID: ${id}` }] };
+  }
+
+  async batchImport({ objectType, items }) {
+    if (!objectType || !Array.isArray(items)) {
+      throw new Error("objectType and items are required");
+    }
+
+    const BATCH_SIZE = 60;
+    const results = {
+      created: 0,
+      notes_created: 0,
+      notes_linked: 0,
+      errors: [],
+      record_ids: [],
+    };
+
+    if (items.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+          }
+        ]
+      };
+    }
+
+    const recordsData = items.map((item) => item.data);
+    const createdRecords = [];
+
+    try {
+      for (let i = 0; i < recordsData.length; i += BATCH_SIZE) {
+        const batch = recordsData.slice(i, i + BATCH_SIZE);
+        const created = await this.makeRequest(`/rest/batch/${objectType}`, "POST", batch);
+        if (created?.errors) {
+          results.errors.push(`Records batch ${i / BATCH_SIZE + 1} errors: ${JSON.stringify(created.errors)}`);
+        }
+        const createdBatch = this._extractBatchArray(created);
+        if (createdBatch) {
+          createdRecords.push(...createdBatch);
+        } else {
+          results.errors.push(`Unexpected records response for batch ${i / BATCH_SIZE + 1}`);
+        }
+      }
+    } catch (error) {
+      results.errors.push(`Records batch failed: ${error.message}`);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+          }
+        ]
+      };
+    }
+
+    results.created = createdRecords.length;
+    results.record_ids = createdRecords.map((record) => record?.id).filter(Boolean);
+
+    if (createdRecords.length !== recordsData.length) {
+      results.errors.push(
+        `Expected ${recordsData.length} records, received ${createdRecords.length}`
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+          }
+        ]
+      };
+    }
+
+    const notesData = [];
+    const noteToRecordIds = [];
+    items.forEach((item, index) => {
+      if (!item?.note) return;
+      const payload = { title: item.note.title };
+      if (item.note.body) {
+        payload.bodyV2 = { markdown: item.note.body };
+      }
+      notesData.push(payload);
+      noteToRecordIds.push(createdRecords[index]?.id);
+    });
+
+    if (notesData.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+          }
+        ]
+      };
+    }
+
+    const createdNotes = [];
+    try {
+      for (let i = 0; i < notesData.length; i += BATCH_SIZE) {
+        const batch = notesData.slice(i, i + BATCH_SIZE);
+        const created = await this.makeRequest("/rest/batch/notes", "POST", batch);
+        if (created?.errors) {
+          results.errors.push(`Notes batch ${i / BATCH_SIZE + 1} errors: ${JSON.stringify(created.errors)}`);
+        }
+        const createdBatch = this._extractBatchArray(created);
+        if (createdBatch) {
+          createdNotes.push(...createdBatch);
+        } else {
+          results.errors.push(`Unexpected notes response for batch ${i / BATCH_SIZE + 1}`);
+        }
+      }
+    } catch (error) {
+      results.errors.push(`Notes batch failed: ${error.message}`);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+          }
+        ]
+      };
+    }
+
+    results.notes_created = createdNotes.length;
+
+    if (createdNotes.length !== notesData.length) {
+      results.errors.push(
+        `Expected ${notesData.length} notes, received ${createdNotes.length}`
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+          }
+        ]
+      };
+    }
+
+    const targetField = this._noteTargetFieldFor(objectType);
+    const targetsData = [];
+    createdNotes.forEach((note, index) => {
+      const recordId = noteToRecordIds[index];
+      if (!recordId) {
+        results.errors.push(`Missing record ID for note index ${index}`);
+        return;
+      }
+      targetsData.push({
+        noteId: note.id,
+        [targetField]: recordId
+      });
+    });
+
+    if (targetsData.length > 0) {
+      try {
+        for (let i = 0; i < targetsData.length; i += BATCH_SIZE) {
+          const batch = targetsData.slice(i, i + BATCH_SIZE);
+          await this.makeRequest("/rest/batch/noteTargets", "POST", batch);
+        }
+        results.notes_linked = targetsData.length;
+      } catch (error) {
+        results.errors.push(`noteTargets batch failed: ${error.message}`);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Batch import result: ${JSON.stringify(results, null, 2)}`
+        }
+      ]
+    };
   }
 
   // Search methods
