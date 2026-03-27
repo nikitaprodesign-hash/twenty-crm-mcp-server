@@ -168,6 +168,103 @@ class TwentyCRMServer {
     return null;
   }
 
+  _pickBatchImportIdentifier(record, fallbackData) {
+    const sources = [record, fallbackData];
+    const preferredKeys = [
+      "name",
+      "title",
+      "label",
+      "displayName",
+      "fullName",
+      "email",
+      "companyName",
+      "domainName",
+      "phone",
+      "externalId",
+      "external_id",
+      "slug",
+    ];
+
+    for (const source of sources) {
+      if (!source || typeof source !== "object") continue;
+
+      for (const key of preferredKeys) {
+        const value = source[key];
+        if (typeof value === "string" && value.trim()) {
+          return value.replace(/\s+/g, " ").trim();
+        }
+      }
+
+      const firstName = typeof source.firstName === "string" ? source.firstName.trim() : "";
+      const lastName = typeof source.lastName === "string" ? source.lastName.trim() : "";
+      const fullName = `${firstName} ${lastName}`.trim();
+      if (fullName) {
+        return fullName.replace(/\s+/g, " ").trim();
+      }
+    }
+
+    return null;
+  }
+
+  _buildBatchImportRecordReference(record, fallbackData, index) {
+    const reference = {
+      index: index + 1,
+    };
+
+    if (record?.id) {
+      reference.id = record.id;
+    }
+
+    const identifier = this._pickBatchImportIdentifier(record, fallbackData);
+    if (identifier) {
+      reference.identifier = identifier;
+    }
+
+    return reference;
+  }
+
+  _buildBatchImportResponse(objectType, results) {
+    const status = results.errors.length === 0 ? "completed successfully" : "completed with issues";
+    const lines = [
+      `Batch import ${status} for ${objectType}.`,
+      `Created ${results.created} record(s).`,
+    ];
+
+    if (results.notes_created > 0 || results.notes_linked > 0) {
+      lines.push(`Created ${results.notes_created} note(s) and linked ${results.notes_linked} note(s).`);
+    }
+
+    if (Array.isArray(results.records) && results.records.length > 0) {
+      lines.push("Record references:");
+      for (const record of results.records) {
+        const parts = [`#${record.index}`];
+        if (record.id) {
+          parts.push(`id=${record.id}`);
+        }
+        if (record.identifier) {
+          parts.push(`identifier=${JSON.stringify(record.identifier)}`);
+        }
+        lines.push(`- ${parts.join(", ")}`);
+      }
+    }
+
+    if (results.errors.length > 0) {
+      lines.push("Errors:");
+      for (const error of results.errors) {
+        lines.push(`- ${error}`);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: lines.join("\n"),
+        }
+      ]
+    };
+  }
+
   _attachHandlers(server) {
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
@@ -556,7 +653,7 @@ class TwentyCRMServer {
           },
           {
             name: "batch_import",
-            description: "Batch create records with optional notes and auto-link them via noteTargets. Max 60 items per call.",
+            description: "Batch create records with optional notes and auto-link them via noteTargets. Max 60 items per call. Returns a concise summary with record references.",
             inputSchema: {
               type: "object",
               required: ["objectType", "items"],
@@ -1037,22 +1134,15 @@ class TwentyCRMServer {
       notes_created: 0,
       notes_linked: 0,
       errors: [],
-      record_ids: [],
+      records: [],
     };
 
     if (items.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-          }
-        ]
-      };
+      return this._buildBatchImportResponse(objectType, results);
     }
 
     const recordsData = items.map((item) => item.data);
-    const createdRecords = [];
+    const createdRecordReferences = [];
 
     try {
       for (let i = 0; i < recordsData.length; i += BATCH_SIZE) {
@@ -1063,38 +1153,29 @@ class TwentyCRMServer {
         }
         const createdBatch = this._extractBatchArray(created);
         if (createdBatch) {
-          createdRecords.push(...createdBatch);
+          createdBatch.forEach((record, batchIndex) => {
+            const itemIndex = i + batchIndex;
+            createdRecordReferences.push(
+              this._buildBatchImportRecordReference(record, items[itemIndex]?.data, itemIndex)
+            );
+          });
         } else {
           results.errors.push(`Unexpected records response for batch ${i / BATCH_SIZE + 1}`);
         }
       }
     } catch (error) {
       results.errors.push(`Records batch failed: ${error.message}`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-          }
-        ]
-      };
+      return this._buildBatchImportResponse(objectType, results);
     }
 
-    results.created = createdRecords.length;
-    results.record_ids = createdRecords.map((record) => record?.id).filter(Boolean);
+    results.created = createdRecordReferences.length;
+    results.records = createdRecordReferences;
 
-    if (createdRecords.length !== recordsData.length) {
+    if (createdRecordReferences.length !== recordsData.length) {
       results.errors.push(
-        `Expected ${recordsData.length} records, received ${createdRecords.length}`
+        `Expected ${recordsData.length} records, received ${createdRecordReferences.length}`
       );
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-          }
-        ]
-      };
+      return this._buildBatchImportResponse(objectType, results);
     }
 
     const notesData = [];
@@ -1106,21 +1187,14 @@ class TwentyCRMServer {
         payload.bodyV2 = { markdown: item.note.body };
       }
       notesData.push(payload);
-      noteToRecordIds.push(createdRecords[index]?.id);
+      noteToRecordIds.push(createdRecordReferences[index]?.id);
     });
 
     if (notesData.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-          }
-        ]
-      };
+      return this._buildBatchImportResponse(objectType, results);
     }
 
-    const createdNotes = [];
+    const createdNoteIds = [];
     try {
       for (let i = 0; i < notesData.length; i += BATCH_SIZE) {
         const batch = notesData.slice(i, i + BATCH_SIZE);
@@ -1130,49 +1204,41 @@ class TwentyCRMServer {
         }
         const createdBatch = this._extractBatchArray(created);
         if (createdBatch) {
-          createdNotes.push(...createdBatch);
+          createdBatch.forEach((note) => {
+            createdNoteIds.push(note?.id);
+          });
         } else {
           results.errors.push(`Unexpected notes response for batch ${i / BATCH_SIZE + 1}`);
         }
       }
     } catch (error) {
       results.errors.push(`Notes batch failed: ${error.message}`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-          }
-        ]
-      };
+      return this._buildBatchImportResponse(objectType, results);
     }
 
-    results.notes_created = createdNotes.length;
+    results.notes_created = createdNoteIds.length;
 
-    if (createdNotes.length !== notesData.length) {
+    if (createdNoteIds.length !== notesData.length) {
       results.errors.push(
-        `Expected ${notesData.length} notes, received ${createdNotes.length}`
+        `Expected ${notesData.length} notes, received ${createdNoteIds.length}`
       );
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-          }
-        ]
-      };
+      return this._buildBatchImportResponse(objectType, results);
     }
 
     const targetField = this._noteTargetFieldFor(objectType);
     const targetsData = [];
-    createdNotes.forEach((note, index) => {
+    createdNoteIds.forEach((noteId, index) => {
       const recordId = noteToRecordIds[index];
       if (!recordId) {
         results.errors.push(`Missing record ID for note index ${index}`);
         return;
       }
+      if (!noteId) {
+        results.errors.push(`Missing note ID for note index ${index}`);
+        return;
+      }
       targetsData.push({
-        noteId: note.id,
+        noteId,
         [targetField]: recordId
       });
     });
@@ -1189,14 +1255,7 @@ class TwentyCRMServer {
       }
     }
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Batch import result: ${JSON.stringify(results, null, 2)}`
-        }
-      ]
-    };
+    return this._buildBatchImportResponse(objectType, results);
   }
 
   // Search methods
